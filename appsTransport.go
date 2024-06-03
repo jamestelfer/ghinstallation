@@ -73,8 +73,8 @@ func NewAppsTransportWithOptions(tr http.RoundTripper, appID int64, opts ...Apps
 		BaseURL: apiBaseURL,
 		Client:  &http.Client{Transport: tr},
 		tr:      tr,
-		appID:   appID,
-		//fixme
+		appID:   appID, // compatibility for getter
+		issuer:  strconv.FormatInt(appID, 10),
 	}
 
 	for _, fn := range opts {
@@ -88,29 +88,39 @@ func NewAppsTransportWithOptions(tr http.RoundTripper, appID int64, opts ...Apps
 	return t, nil
 }
 
-func NewAppsTransportWithAllOptions(tr http.RoundTripper, opts ...AppsTransportOptionError) (*AppsTransport, error) {
-	t := &AppsTransport{
-		BaseURL: apiBaseURL,
-		Client:  &http.Client{Transport: tr},
-		tr:      tr,
+func NewAppsTransportWithAllOptions(tr http.RoundTripper, opts ...AppsTransportConfigOption) (*AppsTransport, error) {
+	cfg := &AppsTransportConfig{
+		baseURL: apiBaseURL,
+		client:  &http.Client{Transport: tr},
 	}
 
 	for _, fn := range opts {
-		err := fn(t)
-		if err != nil {
-			return nil, err
-		}
+		fn(cfg)
 	}
 
-	if t.issuer == "" {
-		return nil, errors.New("no appID or clientID provided")
+	if cfg.issuer == "" {
+		return nil, errors.New("appID or clientID must be provided")
 	}
 
-	if t.signer == nil {
-		return nil, errors.New("no signer provided")
+	if cfg.signerFunc == nil {
+		return nil, errors.New("signer must be provided")
 	}
 
-	return t, nil
+	signer, err := cfg.signerFunc()
+	if err != nil {
+		return nil, fmt.Errorf("signer creation failed: %w", err)
+	}
+
+	at := &AppsTransport{
+		BaseURL: cfg.baseURL,
+		Client:  cfg.client,
+		tr:      tr,
+		issuer:  cfg.issuer,
+		appID:   cfg.appID,
+		signer:  signer,
+	}
+
+	return at, nil
 }
 
 // RoundTrip implements http.RoundTripper interface.
@@ -154,62 +164,105 @@ func (t *AppsTransport) Issuer() string {
 
 // deprecated: kept only for backwards compatibility.
 type AppsTransportOption func(*AppsTransport)
-type AppsTransportOptionError func(*AppsTransport) error
-
-// Specify the AppID of the GitHub App. Either this or ClientID must be
-// specified, but ClientID is now preferred.
-func WithAppID(appID int64) AppsTransportOptionError {
-	return func(at *AppsTransport) error {
-		// backwards compatibility to support the AppID() getter
-		at.appID = appID
-		at.issuer = strconv.FormatInt(appID, 10)
-
-		return nil
-	}
-}
-
-// Specify the ClientID of the GitHub App. Either this or AppID must be
-// specified, but ClientID is now preferred.
-func WithClientID(clientID string) AppsTransportOptionError {
-	return func(at *AppsTransport) error {
-		at.issuer = clientID
-		return nil
-	}
-}
-
-func WithPrivateKeyFile(privateKeyFile string) AppsTransportOptionError {
-	return func(at *AppsTransport) error {
-		privateKey, err := os.ReadFile(privateKeyFile)
-		if err != nil {
-			return fmt.Errorf("could not read private key: %s", err)
-		}
-
-		return WithPrivateKeyRaw(privateKey)(at)
-	}
-}
-
-func WithPrivateKeyRaw(key []byte) AppsTransportOptionError {
-	return func(at *AppsTransport) error {
-		key, err := jwt.ParseRSAPrivateKeyFromPEM(key)
-		if err != nil {
-			return fmt.Errorf("could not parse private key: %w", err)
-		}
-
-		return WithPrivateKey(key)(at)
-	}
-}
-
-func WithPrivateKey(key *rsa.PrivateKey) AppsTransportOptionError {
-	return func(at *AppsTransport) error {
-		at.signer = NewRSASigner(jwt.SigningMethodRS256, key)
-
-		return nil
-	}
-}
 
 // WithSigner configures the AppsTransport to use the given Signer for generating JWT tokens.
+// Deprecated: use NewAppsTransportWithAllOptions instead
 func WithSigner(signer Signer) AppsTransportOption {
 	return func(at *AppsTransport) {
 		at.signer = signer
+	}
+}
+
+type AppsTransportConfig struct {
+	baseURL    string     // BaseURL is the scheme and host for GitHub API, defaults to https://api.github.com
+	client     Client     // Client to use to refresh tokens, defaults to http.Client with provided transport
+	signerFunc signerFunc // signer signs JWT tokens.
+	issuer     string     // issuer is the ClientID (preferred) or AppID of the GitHub App
+	appID      int64
+}
+
+type AppsTransportConfigOption func(*AppsTransportConfig)
+type signerFunc = func() (Signer, error)
+
+// Specify the AppID of the GitHub App. Either this or ClientID must be
+// specified, but ClientID is now preferred.
+func WithAppID(appID int64) AppsTransportConfigOption {
+	return func(at *AppsTransportConfig) {
+		at.appID = appID
+		at.issuer = strconv.FormatInt(appID, 10)
+	}
+}
+
+// WithClientID specifies the ClientID of the GitHub App. Either this or AppID must be
+// specified, but ClientID is now preferred.
+func WithClientID(clientID string) AppsTransportConfigOption {
+	return func(at *AppsTransportConfig) {
+		at.issuer = clientID
+	}
+}
+
+// WithSigningMethod configures the AppsTransport to use the given Signer for
+// generating JWT tokens.
+func WithSigningMethod(signer Signer) AppsTransportConfigOption {
+	return func(at *AppsTransportConfig) {
+		at.signerFunc = func() (Signer, error) { return signer, nil }
+	}
+}
+
+// WithPrivateKeyFile directs the transport to use the specified private key
+// file for signing requests. The private key is loaded and processed as an RSA
+// key in PEM format as provided by GitHub in the application settings.
+func WithPrivateKeyFile(privateKeyFile string) AppsTransportConfigOption {
+	return func(at *AppsTransportConfig) {
+		at.signerFunc = currySignerFunc(createSignerFromFile, privateKeyFile)
+	}
+}
+
+// WithPrivateKeyRaw directs the transport to use the specified private key for
+// signing requests. The private key is loaded and processed as an RSA key in
+// PEM format as provided by GitHub in the application settings.
+func WithPrivateKeyRaw(key []byte) AppsTransportConfigOption {
+	return func(at *AppsTransportConfig) {
+		at.signerFunc = currySignerFunc(createSignerFromBytes, key)
+	}
+}
+
+// WithPrivateKeyRaw directs the transport to use the specified private key for
+// signing requests. The private key is provided by GitHub in the application
+// settings.
+func WithPrivateKey(key *rsa.PrivateKey) AppsTransportConfigOption {
+	return func(at *AppsTransportConfig) {
+		at.signerFunc = currySignerFunc(createSignerFromKey, key)
+	}
+}
+
+func createSignerFromFile(privateKeyFile string) (Signer, error) {
+	privateKey, err := os.ReadFile(privateKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("could not read private key: %s", err)
+	}
+
+	return createSignerFromBytes(privateKey)
+}
+
+func createSignerFromBytes(rawKey []byte) (Signer, error) {
+	key, err := jwt.ParseRSAPrivateKeyFromPEM(rawKey)
+	if err != nil {
+		return nil, fmt.Errorf("could not parse private key: %w", err)
+	}
+
+	return createSignerFromKey(key)
+}
+
+func createSignerFromKey(key *rsa.PrivateKey) (Signer, error) {
+	return NewRSASigner(jwt.SigningMethodRS256, key), nil
+}
+
+// currySignerFunc allows the createSigner* functions to be simple, callable
+// functions that can be used directly, while still supporting the function
+// interface required for config options.
+func currySignerFunc[T any](deferred func(T) (Signer, error), arg T) signerFunc {
+	return func() (Signer, error) {
+		return deferred(arg)
 	}
 }
